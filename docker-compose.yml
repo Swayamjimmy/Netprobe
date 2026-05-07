@@ -1,0 +1,46 @@
+services:
+  netprobe:
+    build: .
+    ports:
+      - "8080:8080"
+    cap_add:
+      - NET_RAW
+    environment:
+      - DATABASE_URL=postgres://netprobe:netprobe@postgres:5432/netprobe?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: netprobe
+      POSTGRES_PASSWORD: netprobe
+      POSTGRES_DB: netprobe
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U netprobe"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - netprobe
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
