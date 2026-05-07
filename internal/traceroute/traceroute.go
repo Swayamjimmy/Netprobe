@@ -4,14 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"time"
+	"os/exec"
+	"regexp"
+	"strconv"
+	"strings"
 
 	"netprobe/internal/ws"
-
-	gotraceroute "github.com/kjansson/go-traceroute"
 )
 
-// Hop represents a single router along the path to the target
 type Hop struct {
 	TTL     int      `json:"ttl"`
 	IP      string   `json:"ip"`
@@ -20,7 +20,6 @@ type Hop struct {
 	Geo     *GeoInfo `json:"geo,omitempty"`
 }
 
-// GeoInfo holds geographic and network ownership data for an IP
 type GeoInfo struct {
 	City    string  `json:"city"`
 	Country string  `json:"country"`
@@ -30,46 +29,28 @@ type GeoInfo struct {
 	AS      string  `json:"as"`
 }
 
-// Result holds the complete traceroute with all hops
 type Result struct {
 	Target string `json:"target"`
 	Hops   []Hop  `json:"hops"`
 	Total  int    `json:"total_hops"`
 }
 
-// Run performs a UDP traceroute and streams each hop over WebSocket
 func Run(target string, hub *ws.Hub) (*Result, error) {
-	tracer := gotraceroute.New()
-	tracer.Address = target
-	tracer.MaxTTL = 30
-	tracer.Timeout = 3 * time.Second
-	tracer.DNSLookup = true
-
-	traceResult, err := tracer.Trace()
-	if err != nil {
+	out, err := exec.Command("traceroute", "-n", "-m", "30", "-w", "3", target).CombinedOutput()
+	if err != nil && len(out) == 0 {
 		return nil, fmt.Errorf("traceroute failed: %w", err)
 	}
 
-	var hops []Hop
-	for _, h := range traceResult.Hops {
-		hop := Hop{
-			TTL:     h.TTL,
-			IP:      h.Address,
-			Host:    h.Host,
-			Latency: h.Latency,
-		}
+	hops := parseTraceroute(string(out))
 
-		// Look up geographic location for valid IPs
-		if h.Address != "" && h.Address != "*" {
-			geo, err := lookupGeo(h.Address)
+	for i := range hops {
+		if hops[i].IP != "*" && hops[i].IP != "" {
+			geo, err := lookupGeo(hops[i].IP)
 			if err == nil {
-				hop.Geo = geo
+				hops[i].Geo = geo
 			}
 		}
-
-		hops = append(hops, hop)
-		// Stream each hop to connected clients as it resolves
-		hub.Broadcast(ws.Message{Type: "traceroute_hop", Target: target, Data: hop})
+		hub.Broadcast(ws.Message{Type: "traceroute_hop", Target: target, Data: hops[i]})
 	}
 
 	result := &Result{Target: target, Hops: hops, Total: len(hops)}
@@ -77,7 +58,45 @@ func Run(target string, hub *ws.Hub) (*Result, error) {
 	return result, nil
 }
 
-// lookupGeo calls ip-api.com to get lat/lon/city/country/ISP for an IP
+func parseTraceroute(output string) []Hop {
+	var hops []Hop
+	lines := strings.Split(output, "\n")
+	re := regexp.MustCompile(`^\s*(\d+)\s+(.+)$`)
+	ipRe := regexp.MustCompile(`(\d+\.\d+\.\d+\.\d+)`)
+	latRe := regexp.MustCompile(`([\d.]+)\s*ms`)
+
+	for _, line := range lines {
+		match := re.FindStringSubmatch(line)
+		if match == nil {
+			continue
+		}
+
+		ttl, _ := strconv.Atoi(match[1])
+		rest := match[2]
+
+		if strings.TrimSpace(rest) == "* * *" {
+			hops = append(hops, Hop{TTL: ttl, IP: "*", Latency: 0})
+			continue
+		}
+
+		ips := ipRe.FindAllString(rest, -1)
+		lats := latRe.FindAllStringSubmatch(rest, -1)
+
+		ip := "*"
+		if len(ips) > 0 {
+			ip = ips[0]
+		}
+
+		latency := 0.0
+		if len(lats) > 0 {
+			latency, _ = strconv.ParseFloat(lats[0][1], 64)
+		}
+
+		hops = append(hops, Hop{TTL: ttl, IP: ip, Host: ip, Latency: latency})
+	}
+	return hops
+}
+
 func lookupGeo(ip string) (*GeoInfo, error) {
 	resp, err := http.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=city,country,lat,lon,isp,as", ip))
 	if err != nil {

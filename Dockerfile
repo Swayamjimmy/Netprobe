@@ -8,7 +8,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o netprobe ./cmd/server
 
 FROM alpine:latest
 
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates traceroute
 WORKDIR /app
 COPY --from=builder /app/netprobe .
 
