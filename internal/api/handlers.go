@@ -3,7 +3,9 @@ package api
 import (
 	"database/sql"
 	"encoding/json"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"netprobe/internal/classifier"
@@ -99,11 +101,19 @@ func handleDiagnose(hub *ws.Hub, database *sql.DB) http.HandlerFunc {
 			return
 		}
 
+		// Send client info so frontend knows where the request originated
+		clientIP := getClientIP(r)
+		hub.Broadcast(ws.Message{Type: "client_info", Target: req.Target, Data: map[string]string{
+			"client_ip": clientIP,
+		}})
+
+		// Run all diagnostic modules in sequence
 		pingResult, _ := ping.Run(req.Target, 10, time.Second, hub)
 		traceResult, _ := traceroute.Run(req.Target, hub)
 		dnsResult, _ := dns.Benchmark(req.Target, hub)
 		speedResult, _ := speedtest.Run(hub)
 
+		// Feed all results into the classifier
 		diagnosis := classifier.Classify(pingResult, traceResult, dnsResult, speedResult)
 
 		hub.Broadcast(ws.Message{Type: "diagnosis", Target: req.Target, Data: diagnosis})
@@ -180,4 +190,16 @@ func saveResult(database *sql.DB, testType, target string, result interface{}) {
 		"INSERT INTO diagnostic_runs (test_type, target, result) VALUES ($1, $2, $3)",
 		testType, target, string(data),
 	)
+}
+
+// getClientIP extracts the real client IP from the request
+func getClientIP(r *http.Request) string {
+	if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
+		return strings.Split(ip, ",")[0]
+	}
+	if ip := r.Header.Get("X-Real-IP"); ip != "" {
+		return ip
+	}
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	return host
 }
