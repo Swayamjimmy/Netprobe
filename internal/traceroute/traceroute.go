@@ -56,14 +56,19 @@ var (
 )
 
 func Run(target string, clientIP string, hub *ws.Hub) (*Result, error) {
-	userGeo, err := lookupGeo(clientIP)
+	userGeo, _ := lookupGeo(clientIP)
 
 	countryCode := "US"
-	if err == nil && userGeo != nil && userGeo.CountryCode != "" {
+
+	if userGeo != nil && userGeo.CountryCode != "" {
 		countryCode = userGeo.CountryCode
 	}
 
-	log.Printf("🌍 Requesting Globalping probe in country: %s (IP: %s)", countryCode, clientIP)
+	log.Printf(
+		"🌍 Requesting Globalping probe in country: %s (IP: %s)",
+		countryCode,
+		clientIP,
+	)
 
 	measurementID, err := startGlobalpingTrace(target, countryCode)
 	if err != nil {
@@ -75,7 +80,7 @@ func Run(target string, clientIP string, hub *ws.Hub) (*Result, error) {
 		Hops:   []Hop{},
 	}
 
-	// Add synthetic origin node
+	// origin node
 	if userGeo != nil {
 		origin := Hop{
 			TTL:      0,
@@ -106,7 +111,11 @@ func Run(target string, clientIP string, hub *ws.Hub) (*Result, error) {
 			return nil, err
 		}
 
-		log.Printf("📡 Globalping Poll - Status: %s | Hops Received: %d", status, len(rawHops))
+		log.Printf(
+			"📡 Globalping Poll - Status: %s | Hops Received: %d",
+			status,
+			len(rawHops),
+		)
 
 		for _, hop := range rawHops {
 
@@ -129,30 +138,16 @@ func Run(target string, clientIP string, hub *ws.Hub) (*Result, error) {
 					err,
 				)
 
-				// still broadcast for debugging
-				result.Hops = append(result.Hops, hop)
-
-				hub.Broadcast(ws.Message{
-					Type:   "traceroute_hop",
-					Target: target,
-					Data:   hop,
-				})
-
 				continue
 			}
 
 			log.Printf(
-				"✅ GEO OK | TTL=%d | IP=%s | %s, %s | LAT=%f LON=%f",
+				"✅ GEO OK | TTL=%d | IP=%s | %s, %s",
 				hop.TTL,
 				hop.IP,
 				geo.City,
 				geo.Country,
-				geo.Lat,
-				geo.Lon,
 			)
-
-			hop.Geo = geo
-			hop.Mappable = true
 
 			hop.Geo = geo
 			hop.Mappable = true
@@ -205,11 +200,6 @@ func startGlobalpingTrace(target, location string) (string, error) {
 
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("globalping error %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-
 	var res struct {
 		ID string `json:"id"`
 	}
@@ -236,11 +226,6 @@ func getGlobalpingResults(measurementID string) (string, []Hop, error) {
 	if err != nil {
 		return "", nil, err
 	}
-
-	log.Printf(
-		"🌐 GLOBALPING RAW RESPONSE: %s",
-		string(bodyBytes),
-	)
 
 	var res struct {
 		Status  string `json:"status"`
@@ -298,7 +283,6 @@ func getGlobalpingResults(measurementID string) (string, []Hop, error) {
 }
 
 func lookupGeo(ip string) (*GeoInfo, error) {
-	// Check cache first
 	geoMutex.RLock()
 
 	if cached, exists := geoCache[ip]; exists {
@@ -350,7 +334,6 @@ func lookupGeo(ip string) (*GeoInfo, error) {
 		AS:          fmt.Sprintf("%v", data.Connection.ASN),
 	}
 
-	// Save to cache
 	geoMutex.Lock()
 	geoCache[ip] = geo
 	geoMutex.Unlock()
