@@ -133,8 +133,17 @@ func handleDiagnose(hub *ws.Hub, database *sql.DB) http.HandlerFunc {
 		dnsResult, _ := dns.Benchmark(req.Target, hub)
 
 		log.Println("🚦 DNS FINISHED. STARTING SPEEDTEST...")
-		speedResult, _ := speedtest.Run(hub)
+		speedResult, err := speedtest.Run(hub)
 
+		if err != nil {
+			log.Printf("⚠️ SPEEDTEST FAILED: %v", err)
+
+			speedResult = &speedtest.Result{
+				DownloadMbps: 0,
+				DurationMs:   0,
+				BytesRead:    0,
+			}
+		}
 		diagnosis := classifier.Classify(pingResult, traceResult, dnsResult, speedResult)
 
 		hub.Broadcast(ws.Message{Type: "diagnosis", Target: req.Target, Data: diagnosis})
