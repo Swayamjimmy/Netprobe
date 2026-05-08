@@ -247,7 +247,14 @@ func getGlobalpingResults(measurementID string) (string, []Hop, error) {
 		} `json:"results"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", nil, err
+	}
+
+	log.Printf("🌐 GLOBALPING RAW RESPONSE: %s", string(bodyBytes))
+
+	if err := json.Unmarshal(bodyBytes, &res); err != nil {
 		return "", nil, err
 	}
 
