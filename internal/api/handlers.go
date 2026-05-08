@@ -110,23 +110,29 @@ func handleDiagnose(hub *ws.Hub, database *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		// Prefer explicit IP from frontend to bypass Docker NAT
 		clientIP := req.ClientIP
 		if clientIP == "" {
-			clientIP = getClientIP(r) // Fallback
+			clientIP = getClientIP(r)
 		}
 
 		hub.Broadcast(ws.Message{Type: "client_info", Target: req.Target, Data: map[string]string{
 			"client_ip": clientIP,
 		}})
 
+		// --- ADD THESE CHECKPOINT LOGS ---
+		log.Println("🚦 STARTING PING TEST...")
 		pingResult, _ := ping.Run(req.Target, 10, time.Second, hub)
+
+		log.Println("🚦 PING FINISHED. STARTING TRACEROUTE...")
 		traceResult, err := traceroute.Run(req.Target, clientIP, hub)
 		if err != nil {
-			// Print the fatal error to the EC2 terminal
 			log.Printf("🚨 TRACEROUTE FATAL ERROR: %v", err)
 		}
+
+		log.Println("🚦 TRACEROUTE FINISHED. STARTING DNS...")
 		dnsResult, _ := dns.Benchmark(req.Target, hub)
+
+		log.Println("🚦 DNS FINISHED. STARTING SPEEDTEST...")
 		speedResult, _ := speedtest.Run(hub)
 
 		diagnosis := classifier.Classify(pingResult, traceResult, dnsResult, speedResult)
