@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -80,6 +81,8 @@ func Run(target string, clientIP string, hub *ws.Hub) (*Result, error) {
 				geo, err := lookupGeo(hop.IP)
 				if err == nil && geo != nil {
 					hop.Geo = geo
+				} else {
+					log.Printf("Map dot failed for IP %s: %v", hop.IP, err)
 				}
 			}
 
