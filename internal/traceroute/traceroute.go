@@ -1,13 +1,11 @@
 package traceroute
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os/exec"
-	"regexp"
-	"strconv"
-	"strings"
+	"time"
 
 	"netprobe/internal/ws"
 )
@@ -21,12 +19,13 @@ type Hop struct {
 }
 
 type GeoInfo struct {
-	City    string  `json:"city"`
-	Country string  `json:"country"`
-	Lat     float64 `json:"lat"`
-	Lon     float64 `json:"lon"`
-	ISP     string  `json:"isp"`
-	AS      string  `json:"as"`
+	City        string  `json:"city"`
+	Country     string  `json:"country"`
+	CountryCode string  `json:"countryCode,omitempty"`
+	Lat         float64 `json:"lat"`
+	Lon         float64 `json:"lon"`
+	ISP         string  `json:"isp"`
+	AS          string  `json:"as"`
 }
 
 type Result struct {
@@ -35,90 +34,143 @@ type Result struct {
 	Total  int    `json:"total_hops"`
 }
 
-func Run(target string, hub *ws.Hub) (*Result, error) {
-	out, err := exec.Command("traceroute", "-n", "-m", "30", "-w", "3", target).CombinedOutput()
-	if err != nil && len(out) == 0 {
-		return nil, fmt.Errorf("traceroute failed: %w", err)
+type gpMeasurementRequest struct {
+	Type      string       `json:"type"`
+	Target    string       `json:"target"`
+	Locations []gpLocation `json:"locations"`
+}
+
+type gpLocation struct {
+	Country string `json:"country"`
+}
+
+func Run(target string, clientIP string, hub *ws.Hub) (*Result, error) {
+	userGeo, err := lookupGeo(clientIP)
+	countryCode := "US"
+	if err == nil && userGeo != nil && userGeo.CountryCode != "" {
+		countryCode = userGeo.CountryCode
 	}
 
-	hops := parseTraceroute(string(out))
+	measurementID, err := startGlobalpingTrace(target, countryCode)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start distributed trace: %w", err)
+	}
 
-	for i := range hops {
-		if hops[i].IP != "*" && hops[i].IP != "" {
-			geo, err := lookupGeo(hops[i].IP)
-			if err == nil {
-				hops[i].Geo = geo
-			}
+	result := &Result{Target: target}
+
+	for {
+		time.Sleep(1 * time.Second)
+
+		status, rawHops, err := getGlobalpingResults(measurementID)
+		if err != nil {
+			return nil, err
 		}
-		hub.Broadcast(ws.Message{Type: "traceroute_hop", Target: target, Data: hops[i]})
+
+		for i := len(result.Hops); i < len(rawHops); i++ {
+			hop := rawHops[i]
+
+			if hop.IP != "*" && hop.IP != "" {
+				geo, err := lookupGeo(hop.IP)
+				if err == nil {
+					hop.Geo = geo
+				}
+			}
+
+			result.Hops = append(result.Hops, hop)
+			hub.Broadcast(ws.Message{Type: "traceroute_hop", Target: target, Data: hop})
+		}
+
+		if status == "finished" {
+			break
+		}
 	}
 
-	result := &Result{Target: target, Hops: hops, Total: len(hops)}
+	result.Total = len(result.Hops)
 	hub.Broadcast(ws.Message{Type: "traceroute_complete", Target: target, Data: result})
 	return result, nil
 }
 
-func parseTraceroute(output string) []Hop {
-	var hops []Hop
-	lines := strings.Split(output, "\n")
-	re := regexp.MustCompile(`^\s*(\d+)\s+(.+)$`)
-	ipRe := regexp.MustCompile(`(\d+\.\d+\.\d+\.\d+)`)
-	latRe := regexp.MustCompile(`([\d.]+)\s*ms`)
-
-	for _, line := range lines {
-		match := re.FindStringSubmatch(line)
-		if match == nil {
-			continue
-		}
-
-		ttl, _ := strconv.Atoi(match[1])
-		rest := match[2]
-
-		if strings.TrimSpace(rest) == "* * *" {
-			hops = append(hops, Hop{TTL: ttl, IP: "*", Latency: 0})
-			continue
-		}
-
-		ips := ipRe.FindAllString(rest, -1)
-		lats := latRe.FindAllStringSubmatch(rest, -1)
-
-		ip := "*"
-		if len(ips) > 0 {
-			ip = ips[0]
-		}
-
-		latency := 0.0
-		if len(lats) > 0 {
-			latency, _ = strconv.ParseFloat(lats[0][1], 64)
-		}
-
-		hops = append(hops, Hop{TTL: ttl, IP: ip, Host: ip, Latency: latency})
+func startGlobalpingTrace(target, location string) (string, error) {
+	reqBody := gpMeasurementRequest{
+		Type:      "traceroute",
+		Target:    target,
+		Locations: []gpLocation{{Country: location}},
 	}
-	return hops
+
+	jsonData, _ := json.Marshal(reqBody)
+	resp, err := http.Post("https://api.globalping.io/v1/measurements", "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var res struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return "", err
+	}
+	return res.ID, nil
+}
+
+func getGlobalpingResults(measurementID string) (string, []Hop, error) {
+	resp, err := http.Get("https://api.globalping.io/v1/measurements/" + measurementID)
+	if err != nil {
+		return "", nil, err
+	}
+	defer resp.Body.Close()
+
+	var res struct {
+		Status  string `json:"status"`
+		Results []struct {
+			Result struct {
+				Hops []struct {
+					Hop   int `json:"hop"`
+					Stats []struct {
+						IP  string  `json:"ip"`
+						Rtt float64 `json:"rtt"`
+					} `json:"stats"`
+				} `json:"hops"`
+			} `json:"result"`
+		} `json:"results"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return "", nil, err
+	}
+
+	var parsedHops []Hop
+	if len(res.Results) > 0 {
+		for _, rawHop := range res.Results[0].Result.Hops {
+			ip := "*"
+			latency := 0.0
+			if len(rawHop.Stats) > 0 {
+				ip = rawHop.Stats[0].IP
+				latency = rawHop.Stats[0].Rtt
+			}
+			parsedHops = append(parsedHops, Hop{
+				TTL:     rawHop.Hop,
+				IP:      ip,
+				Host:    ip,
+				Latency: latency,
+			})
+		}
+	}
+
+	return res.Status, parsedHops, nil
 }
 
 func lookupGeo(ip string) (*GeoInfo, error) {
-	resp, err := http.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=city,country,lat,lon,isp,as", ip))
+	resp, err := http.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=city,country,countryCode,lat,lon,isp,as", ip))
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	var data struct {
-		City    string  `json:"city"`
-		Country string  `json:"country"`
-		Lat     float64 `json:"lat"`
-		Lon     float64 `json:"lon"`
-		ISP     string  `json:"isp"`
-		AS      string  `json:"as"`
-	}
+	var data GeoInfo
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return nil, err
 	}
 
-	return &GeoInfo{
-		City: data.City, Country: data.Country,
-		Lat: data.Lat, Lon: data.Lon,
-		ISP: data.ISP, AS: data.AS,
-	}, nil
+	return &data, nil
 }
