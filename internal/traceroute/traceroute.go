@@ -120,10 +120,39 @@ func Run(target string, clientIP string, hub *ws.Hub) (*Result, error) {
 			}
 
 			geo, err := lookupGeo(hop.IP)
+
 			if err != nil {
-				log.Printf("Geo lookup failed for %s: %v", hop.IP, err)
+				log.Printf(
+					"❌ GEO FAIL | TTL=%d | IP=%s | ERR=%v",
+					hop.TTL,
+					hop.IP,
+					err,
+				)
+
+				// still broadcast for debugging
+				result.Hops = append(result.Hops, hop)
+
+				hub.Broadcast(ws.Message{
+					Type:   "traceroute_hop",
+					Target: target,
+					Data:   hop,
+				})
+
 				continue
 			}
+
+			log.Printf(
+				"✅ GEO OK | TTL=%d | IP=%s | %s, %s | LAT=%f LON=%f",
+				hop.TTL,
+				hop.IP,
+				geo.City,
+				geo.Country,
+				geo.Lat,
+				geo.Lon,
+			)
+
+			hop.Geo = geo
+			hop.Mappable = true
 
 			hop.Geo = geo
 			hop.Mappable = true
@@ -256,13 +285,8 @@ func lookupGeo(ip string) (*GeoInfo, error) {
 
 	geoMutex.RUnlock()
 
-	time.Sleep(120 * time.Millisecond)
-
 	resp, err := http.Get(
-		fmt.Sprintf(
-			"http://ip-api.com/json/%s?fields=status,city,country,countryCode,lat,lon,isp,as",
-			ip,
-		),
+		fmt.Sprintf("https://ipwho.is/%s", ip),
 	)
 
 	if err != nil {
@@ -272,32 +296,34 @@ func lookupGeo(ip string) (*GeoInfo, error) {
 	defer resp.Body.Close()
 
 	var data struct {
-		Status      string  `json:"status"`
+		Success     bool    `json:"success"`
 		City        string  `json:"city"`
 		Country     string  `json:"country"`
-		CountryCode string  `json:"countryCode"`
-		Lat         float64 `json:"lat"`
-		Lon         float64 `json:"lon"`
-		ISP         string  `json:"isp"`
-		AS          string  `json:"as"`
+		CountryCode string  `json:"country_code"`
+		Latitude    float64 `json:"latitude"`
+		Longitude   float64 `json:"longitude"`
+		Connection  struct {
+			ISP string `json:"isp"`
+			ASN string `json:"asn"`
+		} `json:"connection"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return nil, err
 	}
 
-	if data.Status != "success" {
-		return nil, fmt.Errorf("lookup failed")
+	if !data.Success {
+		return nil, fmt.Errorf("geo lookup failed")
 	}
 
 	geo := &GeoInfo{
 		City:        data.City,
 		Country:     data.Country,
 		CountryCode: data.CountryCode,
-		Lat:         data.Lat,
-		Lon:         data.Lon,
-		ISP:         data.ISP,
-		AS:          data.AS,
+		Lat:         data.Latitude,
+		Lon:         data.Longitude,
+		ISP:         data.Connection.ISP,
+		AS:          data.Connection.ASN,
 	}
 
 	geoMutex.Lock()
