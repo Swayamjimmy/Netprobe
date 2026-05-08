@@ -23,17 +23,18 @@ type Progress struct {
 func Run(hub *ws.Hub) (*Result, error) {
 
 	client := &http.Client{
-		Timeout: 15 * time.Second,
+		Timeout: 10 * time.Second,
 	}
 
-	url := "https://speed.cloudflare.com/__down?bytes=5000000"
+	// smaller test file
+	url := "https://speed.cloudflare.com/__down?bytes=2000000"
 
 	start := time.Now()
 
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"speedtest download failed: %w",
+			"speedtest failed: %w",
 			err,
 		)
 	}
@@ -51,7 +52,7 @@ func Run(hub *ws.Hub) (*Result, error) {
 
 		totalBytes += int64(n)
 
-		if time.Since(lastReport) > 300*time.Millisecond {
+		if time.Since(lastReport) > 250*time.Millisecond {
 
 			elapsed := time.Since(start).Seconds()
 
@@ -60,7 +61,7 @@ func Run(hub *ws.Hub) (*Result, error) {
 					(elapsed * 1_000_000)
 
 			percent :=
-				int((float64(totalBytes) / 5_000_000) * 100)
+				int((float64(totalBytes) / 2_000_000) * 100)
 
 			if percent > 100 {
 				percent = 100

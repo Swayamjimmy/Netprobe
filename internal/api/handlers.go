@@ -133,10 +133,47 @@ func handleDiagnose(hub *ws.Hub, database *sql.DB) http.HandlerFunc {
 		dnsResult, _ := dns.Benchmark(req.Target, hub)
 
 		log.Println("🚦 DNS FINISHED. STARTING SPEEDTEST...")
-		speedResult, err := speedtest.Run(hub)
 
-		if err != nil {
-			log.Printf("⚠️ SPEEDTEST FAILED: %v", err)
+		var speedResult *speedtest.Result
+
+		speedDone := make(chan struct{})
+
+		go func() {
+
+			defer close(speedDone)
+
+			res, err := speedtest.Run(hub)
+
+			if err != nil {
+
+				log.Printf(
+					"⚠️ SPEEDTEST FAILED: %v",
+					err,
+				)
+
+				speedResult = &speedtest.Result{
+					DownloadMbps: 0,
+					DurationMs:   0,
+					BytesRead:    0,
+				}
+
+				return
+			}
+
+			log.Println("✅ SPEEDTEST COMPLETE")
+
+			speedResult = res
+		}()
+
+		select {
+
+		case <-speedDone:
+
+			log.Println("✅ SPEEDTEST FINISHED")
+
+		case <-time.After(12 * time.Second):
+
+			log.Println("⚠️ SPEEDTEST TIMEOUT")
 
 			speedResult = &speedtest.Result{
 				DownloadMbps: 0,
@@ -144,8 +181,15 @@ func handleDiagnose(hub *ws.Hub, database *sql.DB) http.HandlerFunc {
 				BytesRead:    0,
 			}
 		}
-		diagnosis := classifier.Classify(pingResult, traceResult, dnsResult, speedResult)
 
+		log.Println("🧠 GENERATING DIAGNOSIS...")
+
+		diagnosis := classifier.Classify(
+			pingResult,
+			traceResult,
+			dnsResult,
+			speedResult,
+		)
 		hub.Broadcast(ws.Message{Type: "diagnosis", Target: req.Target, Data: diagnosis})
 		saveResult(database, "diagnosis", req.Target, diagnosis)
 
