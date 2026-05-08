@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -120,7 +121,11 @@ func handleDiagnose(hub *ws.Hub, database *sql.DB) http.HandlerFunc {
 		}})
 
 		pingResult, _ := ping.Run(req.Target, 10, time.Second, hub)
-		traceResult, _ := traceroute.Run(req.Target, clientIP, hub)
+		traceResult, err := traceroute.Run(req.Target, clientIP, hub)
+		if err != nil {
+			// Print the fatal error to the EC2 terminal
+			log.Printf("🚨 TRACEROUTE FATAL ERROR: %v", err)
+		}
 		dnsResult, _ := dns.Benchmark(req.Target, hub)
 		speedResult, _ := speedtest.Run(hub)
 

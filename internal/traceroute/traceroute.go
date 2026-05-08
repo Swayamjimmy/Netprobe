@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -113,6 +114,12 @@ func startGlobalpingTrace(target, location string) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
+
+	// If Globalping rejects us (e.g. 422 or 429 error code)
+	if resp.StatusCode >= 400 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("Globalping API rejected request (Status %d): %s", resp.StatusCode, string(bodyBytes))
+	}
 
 	var res struct {
 		ID string `json:"id"`
