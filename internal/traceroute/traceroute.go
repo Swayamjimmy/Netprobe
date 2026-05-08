@@ -45,12 +45,15 @@ type gpLocation struct {
 }
 
 func Run(target string, clientIP string, hub *ws.Hub) (*Result, error) {
+	// 1. Determine user location for probe selection
 	userGeo, err := lookupGeo(clientIP)
-	countryCode := "US"
+	countryCode := "US" // Default fallback
+
 	if err == nil && userGeo != nil && userGeo.CountryCode != "" {
 		countryCode = userGeo.CountryCode
 	}
 
+	// 2. Start the remote trace
 	measurementID, err := startGlobalpingTrace(target, countryCode)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start distributed trace: %w", err)
@@ -58,6 +61,7 @@ func Run(target string, clientIP string, hub *ws.Hub) (*Result, error) {
 
 	result := &Result{Target: target}
 
+	// 3. Poll for results until complete
 	for {
 		time.Sleep(1 * time.Second)
 
@@ -151,7 +155,7 @@ func getGlobalpingResults(measurementID string) (string, []Hop, error) {
 			parsedHops = append(parsedHops, Hop{
 				TTL:     rawHop.Hop,
 				IP:      ip,
-				Host:    ip,
+				Host:    ip, // We use IP here since Globalping resolves DNS separately
 				Latency: latency,
 			})
 		}

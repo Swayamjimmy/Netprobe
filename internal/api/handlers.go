@@ -3,6 +3,7 @@ package api
 import (
 	"database/sql"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -17,7 +18,8 @@ import (
 )
 
 type TargetRequest struct {
-	Target string `json:"target"`
+	Target   string `json:"target"`
+	ClientIP string `json:"client_ip"` // Added to receive real IP from frontend
 }
 
 func handlePing(hub *ws.Hub, database *sql.DB) http.HandlerFunc {
@@ -48,7 +50,11 @@ func handleTraceroute(hub *ws.Hub, database *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		clientIP := getClientIP(r)
+		// Prefer explicit IP from frontend to bypass Docker NAT
+		clientIP := req.ClientIP
+		if clientIP == "" {
+			clientIP = getClientIP(r) // Fallback
+		}
 
 		result, err := traceroute.Run(req.Target, clientIP, hub)
 		if err != nil {
@@ -103,7 +109,12 @@ func handleDiagnose(hub *ws.Hub, database *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		clientIP := getClientIP(r)
+		// Prefer explicit IP from frontend to bypass Docker NAT
+		clientIP := req.ClientIP
+		if clientIP == "" {
+			clientIP = getClientIP(r) // Fallback
+		}
+
 		hub.Broadcast(ws.Message{Type: "client_info", Target: req.Target, Data: map[string]string{
 			"client_ip": clientIP,
 		}})
@@ -192,12 +203,25 @@ func saveResult(database *sql.DB, testType, target string, result interface{}) {
 }
 
 func getClientIP(r *http.Request) string {
-	if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
-		return strings.Split(ip, ",")[0]
+	ip := ""
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		ip = strings.Split(forwarded, ",")[0]
+	} else if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+		ip = realIP
+	} else {
+		host, _, _ := net.SplitHostPort(r.RemoteAddr)
+		ip = host
 	}
-	if ip := r.Header.Get("X-Real-IP"); ip != "" {
-		return ip
+
+	// Local development fallback
+	if ip == "127.0.0.1" || ip == "::1" || strings.HasPrefix(ip, "192.168.") {
+		resp, err := http.Get("https://api64.ipify.org")
+		if err == nil {
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			return string(body)
+		}
 	}
-	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	return host
+
+	return ip
 }
