@@ -298,6 +298,7 @@ func getGlobalpingResults(measurementID string) (string, []Hop, error) {
 }
 
 func lookupGeo(ip string) (*GeoInfo, error) {
+	// Check cache first
 	geoMutex.RLock()
 
 	if cached, exists := geoCache[ip]; exists {
@@ -324,9 +325,10 @@ func lookupGeo(ip string) (*GeoInfo, error) {
 		CountryCode string  `json:"country_code"`
 		Latitude    float64 `json:"latitude"`
 		Longitude   float64 `json:"longitude"`
-		Connection  struct {
-			ISP string `json:"isp"`
-			ASN string `json:"asn"`
+
+		Connection struct {
+			ISP string      `json:"isp"`
+			ASN interface{} `json:"asn"`
 		} `json:"connection"`
 	}
 
@@ -345,9 +347,10 @@ func lookupGeo(ip string) (*GeoInfo, error) {
 		Lat:         data.Latitude,
 		Lon:         data.Longitude,
 		ISP:         data.Connection.ISP,
-		AS:          data.Connection.ASN,
+		AS:          fmt.Sprintf("%v", data.Connection.ASN),
 	}
 
+	// Save to cache
 	geoMutex.Lock()
 	geoCache[ip] = geo
 	geoMutex.Unlock()
