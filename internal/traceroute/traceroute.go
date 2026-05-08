@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -14,11 +15,13 @@ import (
 )
 
 type Hop struct {
-	TTL     int      `json:"ttl"`
-	IP      string   `json:"ip"`
-	Host    string   `json:"host"`
-	Latency float64  `json:"latency_ms"`
-	Geo     *GeoInfo `json:"geo,omitempty"`
+	TTL      int      `json:"ttl"`
+	IP       string   `json:"ip"`
+	Host     string   `json:"host"`
+	Latency  float64  `json:"latency_ms"`
+	Geo      *GeoInfo `json:"geo,omitempty"`
+	Mappable bool     `json:"mappable"`
+	IsOrigin bool     `json:"is_origin,omitempty"`
 }
 
 type GeoInfo struct {
@@ -47,7 +50,6 @@ type gpLocation struct {
 	Country string `json:"country"`
 }
 
-// Global cache to prevent ip-api.com rate limiting (45 req/min)
 var (
 	geoCache = make(map[string]*GeoInfo)
 	geoMutex sync.RWMutex
@@ -55,22 +57,48 @@ var (
 
 func Run(target string, clientIP string, hub *ws.Hub) (*Result, error) {
 	userGeo, err := lookupGeo(clientIP)
+
 	countryCode := "US"
 	if err == nil && userGeo != nil && userGeo.CountryCode != "" {
 		countryCode = userGeo.CountryCode
 	}
 
-	// 🚨 ADD LOG 1: See what country we are actually requesting
 	log.Printf("🌍 Requesting Globalping probe in country: %s (IP: %s)", countryCode, clientIP)
 
 	measurementID, err := startGlobalpingTrace(target, countryCode)
 	if err != nil {
-		return nil, fmt.Errorf("failed to start distributed trace: %w", err)
+		return nil, err
 	}
 
-	result := &Result{Target: target}
+	result := &Result{
+		Target: target,
+		Hops:   []Hop{},
+	}
 
-	for {
+	// Add synthetic origin node
+	if userGeo != nil {
+		origin := Hop{
+			TTL:      0,
+			IP:       clientIP,
+			Host:     "Client Origin",
+			Latency:  0,
+			Geo:      userGeo,
+			Mappable: true,
+			IsOrigin: true,
+		}
+
+		result.Hops = append(result.Hops, origin)
+
+		hub.Broadcast(ws.Message{
+			Type:   "traceroute_hop",
+			Target: target,
+			Data:   origin,
+		})
+	}
+
+	maxPolls := 20
+
+	for i := 0; i < maxPolls; i++ {
 		time.Sleep(1 * time.Second)
 
 		status, rawHops, err := getGlobalpingResults(measurementID)
@@ -78,23 +106,35 @@ func Run(target string, clientIP string, hub *ws.Hub) (*Result, error) {
 			return nil, err
 		}
 
-		// 🚨 ADD LOG 2: See what Globalping is actually handing back
 		log.Printf("📡 Globalping Poll - Status: %s | Hops Received: %d", status, len(rawHops))
 
-		for i := len(result.Hops); i < len(rawHops); i++ {
-			hop := rawHops[i]
+		for _, hop := range rawHops {
 
-			if hop.IP != "*" && hop.IP != "" {
-				geo, err := lookupGeo(hop.IP)
-				if err == nil && geo != nil {
-					hop.Geo = geo
-				} else {
-					log.Printf("Map dot failed for IP %s: %v", hop.IP, err)
-				}
+			if hop.IP == "" || hop.IP == "*" {
+				continue
 			}
 
+			if isPrivateIP(hop.IP) {
+				log.Printf("Skipping private hop: %s", hop.IP)
+				continue
+			}
+
+			geo, err := lookupGeo(hop.IP)
+			if err != nil {
+				log.Printf("Geo lookup failed for %s: %v", hop.IP, err)
+				continue
+			}
+
+			hop.Geo = geo
+			hop.Mappable = true
+
 			result.Hops = append(result.Hops, hop)
-			hub.Broadcast(ws.Message{Type: "traceroute_hop", Target: target, Data: hop})
+
+			hub.Broadcast(ws.Message{
+				Type:   "traceroute_hop",
+				Target: target,
+				Data:   hop,
+			})
 		}
 
 		if status == "finished" {
@@ -103,44 +143,64 @@ func Run(target string, clientIP string, hub *ws.Hub) (*Result, error) {
 	}
 
 	result.Total = len(result.Hops)
-	hub.Broadcast(ws.Message{Type: "traceroute_complete", Target: target, Data: result})
+
+	hub.Broadcast(ws.Message{
+		Type:   "traceroute_complete",
+		Target: target,
+		Data:   result,
+	})
+
 	return result, nil
 }
 
 func startGlobalpingTrace(target, location string) (string, error) {
 	reqBody := gpMeasurementRequest{
-		Type:      "traceroute",
-		Target:    target,
-		Locations: []gpLocation{{Country: location}},
+		Type:   "traceroute",
+		Target: target,
+		Locations: []gpLocation{
+			{Country: location},
+		},
 	}
 
 	jsonData, _ := json.Marshal(reqBody)
-	resp, err := http.Post("https://api.globalping.io/v1/measurements", "application/json", bytes.NewBuffer(jsonData))
+
+	resp, err := http.Post(
+		"https://api.globalping.io/v1/measurements",
+		"application/json",
+		bytes.NewBuffer(jsonData),
+	)
+
 	if err != nil {
 		return "", err
 	}
+
 	defer resp.Body.Close()
 
-	// If Globalping rejects us (e.g. 422 or 429 error code)
 	if resp.StatusCode >= 400 {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("Globalping API rejected request (Status %d): %s", resp.StatusCode, string(bodyBytes))
+		return "", fmt.Errorf("globalping error %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	var res struct {
 		ID string `json:"id"`
 	}
+
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		return "", err
 	}
+
 	return res.ID, nil
 }
 
 func getGlobalpingResults(measurementID string) (string, []Hop, error) {
-	resp, err := http.Get("https://api.globalping.io/v1/measurements/" + measurementID)
+	resp, err := http.Get(
+		"https://api.globalping.io/v1/measurements/" + measurementID,
+	)
+
 	if err != nil {
 		return "", nil, err
 	}
+
 	defer resp.Body.Close()
 
 	var res struct {
@@ -162,50 +222,60 @@ func getGlobalpingResults(measurementID string) (string, []Hop, error) {
 		return "", nil, err
 	}
 
-	var parsedHops []Hop
+	var parsed []Hop
+
 	if len(res.Results) > 0 {
 		for _, rawHop := range res.Results[0].Result.Hops {
-			ip := "*"
-			latency := 0.0
-			if len(rawHop.Stats) > 0 {
-				ip = rawHop.Stats[0].IP
-				latency = rawHop.Stats[0].Rtt
+
+			if len(rawHop.Stats) == 0 {
+				continue
 			}
-			parsedHops = append(parsedHops, Hop{
-				TTL:     rawHop.Hop,
-				IP:      ip,
-				Host:    ip,
-				Latency: latency,
+
+			ip := rawHop.Stats[0].IP
+
+			parsed = append(parsed, Hop{
+				TTL:      rawHop.Hop,
+				IP:       ip,
+				Host:     ip,
+				Latency:  rawHop.Stats[0].Rtt,
+				Mappable: false,
 			})
 		}
 	}
 
-	return res.Status, parsedHops, nil
+	return res.Status, parsed, nil
 }
 
 func lookupGeo(ip string) (*GeoInfo, error) {
-	// 1. Check if we already have this IP in our cache
 	geoMutex.RLock()
+
 	if cached, exists := geoCache[ip]; exists {
 		geoMutex.RUnlock()
 		return cached, nil
 	}
+
 	geoMutex.RUnlock()
 
-	// 2. Add a tiny delay to prevent bursting the API limit (45 requests/min)
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(120 * time.Millisecond)
 
-	resp, err := http.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=status,city,country,countryCode,lat,lon,isp,as", ip))
+	resp, err := http.Get(
+		fmt.Sprintf(
+			"http://ip-api.com/json/%s?fields=status,city,country,countryCode,lat,lon,isp,as",
+			ip,
+		),
+	)
+
 	if err != nil {
 		return nil, err
 	}
+
 	defer resp.Body.Close()
 
 	var data struct {
 		Status      string  `json:"status"`
 		City        string  `json:"city"`
 		Country     string  `json:"country"`
-		CountryCode string  `json:"countryCode,omitempty"`
+		CountryCode string  `json:"countryCode"`
 		Lat         float64 `json:"lat"`
 		Lon         float64 `json:"lon"`
 		ISP         string  `json:"isp"`
@@ -216,12 +286,11 @@ func lookupGeo(ip string) (*GeoInfo, error) {
 		return nil, err
 	}
 
-	// 3. Reject rate-limit errors and private IPs
-	if data.Status == "fail" {
-		return nil, fmt.Errorf("ip lookup failed (likely rate limited or private IP)")
+	if data.Status != "success" {
+		return nil, fmt.Errorf("lookup failed")
 	}
 
-	geoInfo := &GeoInfo{
+	geo := &GeoInfo{
 		City:        data.City,
 		Country:     data.Country,
 		CountryCode: data.CountryCode,
@@ -231,10 +300,34 @@ func lookupGeo(ip string) (*GeoInfo, error) {
 		AS:          data.AS,
 	}
 
-	// 4. Save to cache for next time
 	geoMutex.Lock()
-	geoCache[ip] = geoInfo
+	geoCache[ip] = geo
 	geoMutex.Unlock()
 
-	return geoInfo, nil
+	return geo, nil
+}
+
+func isPrivateIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+
+	if ip == nil {
+		return true
+	}
+
+	privateRanges := []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"127.0.0.0/8",
+	}
+
+	for _, cidr := range privateRanges {
+		_, subnet, _ := net.ParseCIDR(cidr)
+
+		if subnet.Contains(ip) {
+			return true
+		}
+	}
+
+	return false
 }
