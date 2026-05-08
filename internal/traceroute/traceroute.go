@@ -60,6 +60,9 @@ func Run(target string, clientIP string, hub *ws.Hub) (*Result, error) {
 		countryCode = userGeo.CountryCode
 	}
 
+	// 🚨 ADD LOG 1: See what country we are actually requesting
+	log.Printf("🌍 Requesting Globalping probe in country: %s (IP: %s)", countryCode, clientIP)
+
 	measurementID, err := startGlobalpingTrace(target, countryCode)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start distributed trace: %w", err)
@@ -74,6 +77,9 @@ func Run(target string, clientIP string, hub *ws.Hub) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
+
+		// 🚨 ADD LOG 2: See what Globalping is actually handing back
+		log.Printf("📡 Globalping Poll - Status: %s | Hops Received: %d", status, len(rawHops))
 
 		for i := len(result.Hops); i < len(rawHops); i++ {
 			hop := rawHops[i]
