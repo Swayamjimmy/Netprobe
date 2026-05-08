@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"netprobe/internal/ws"
@@ -44,16 +45,19 @@ type gpLocation struct {
 	Country string `json:"country"`
 }
 
-func Run(target string, clientIP string, hub *ws.Hub) (*Result, error) {
-	// 1. Determine user location for probe selection
-	userGeo, err := lookupGeo(clientIP)
-	countryCode := "US" // Default fallback
+// Global cache to prevent ip-api.com rate limiting (45 req/min)
+var (
+	geoCache = make(map[string]*GeoInfo)
+	geoMutex sync.RWMutex
+)
 
+func Run(target string, clientIP string, hub *ws.Hub) (*Result, error) {
+	userGeo, err := lookupGeo(clientIP)
+	countryCode := "US"
 	if err == nil && userGeo != nil && userGeo.CountryCode != "" {
 		countryCode = userGeo.CountryCode
 	}
 
-	// 2. Start the remote trace
 	measurementID, err := startGlobalpingTrace(target, countryCode)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start distributed trace: %w", err)
@@ -61,7 +65,6 @@ func Run(target string, clientIP string, hub *ws.Hub) (*Result, error) {
 
 	result := &Result{Target: target}
 
-	// 3. Poll for results until complete
 	for {
 		time.Sleep(1 * time.Second)
 
@@ -75,7 +78,7 @@ func Run(target string, clientIP string, hub *ws.Hub) (*Result, error) {
 
 			if hop.IP != "*" && hop.IP != "" {
 				geo, err := lookupGeo(hop.IP)
-				if err == nil {
+				if err == nil && geo != nil {
 					hop.Geo = geo
 				}
 			}
@@ -155,7 +158,7 @@ func getGlobalpingResults(measurementID string) (string, []Hop, error) {
 			parsedHops = append(parsedHops, Hop{
 				TTL:     rawHop.Hop,
 				IP:      ip,
-				Host:    ip, // We use IP here since Globalping resolves DNS separately
+				Host:    ip,
 				Latency: latency,
 			})
 		}
@@ -165,16 +168,57 @@ func getGlobalpingResults(measurementID string) (string, []Hop, error) {
 }
 
 func lookupGeo(ip string) (*GeoInfo, error) {
-	resp, err := http.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=city,country,countryCode,lat,lon,isp,as", ip))
+	// 1. Check if we already have this IP in our cache
+	geoMutex.RLock()
+	if cached, exists := geoCache[ip]; exists {
+		geoMutex.RUnlock()
+		return cached, nil
+	}
+	geoMutex.RUnlock()
+
+	// 2. Add a tiny delay to prevent bursting the API limit (45 requests/min)
+	time.Sleep(150 * time.Millisecond)
+
+	resp, err := http.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=status,city,country,countryCode,lat,lon,isp,as", ip))
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	var data GeoInfo
+	var data struct {
+		Status      string  `json:"status"`
+		City        string  `json:"city"`
+		Country     string  `json:"country"`
+		CountryCode string  `json:"countryCode,omitempty"`
+		Lat         float64 `json:"lat"`
+		Lon         float64 `json:"lon"`
+		ISP         string  `json:"isp"`
+		AS          string  `json:"as"`
+	}
+
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return nil, err
 	}
 
-	return &data, nil
+	// 3. Reject rate-limit errors and private IPs
+	if data.Status == "fail" {
+		return nil, fmt.Errorf("ip lookup failed (likely rate limited or private IP)")
+	}
+
+	geoInfo := &GeoInfo{
+		City:        data.City,
+		Country:     data.Country,
+		CountryCode: data.CountryCode,
+		Lat:         data.Lat,
+		Lon:         data.Lon,
+		ISP:         data.ISP,
+		AS:          data.AS,
+	}
+
+	// 4. Save to cache for next time
+	geoMutex.Lock()
+	geoCache[ip] = geoInfo
+	geoMutex.Unlock()
+
+	return geoInfo, nil
 }
