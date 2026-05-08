@@ -232,27 +232,31 @@ func getGlobalpingResults(measurementID string) (string, []Hop, error) {
 
 	defer resp.Body.Close()
 
-	var res struct {
-		Status  string `json:"status"`
-		Results []struct {
-			Result struct {
-				Hops []struct {
-					Hop   int `json:"hop"`
-					Stats []struct {
-						IP  string  `json:"ip"`
-						Rtt float64 `json:"rtt"`
-					} `json:"stats"`
-				} `json:"hops"`
-			} `json:"result"`
-		} `json:"results"`
-	}
-
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", nil, err
 	}
 
-	log.Printf("🌐 GLOBALPING RAW RESPONSE: %s", string(bodyBytes))
+	log.Printf(
+		"🌐 GLOBALPING RAW RESPONSE: %s",
+		string(bodyBytes),
+	)
+
+	var res struct {
+		Status  string `json:"status"`
+		Results []struct {
+			Result struct {
+				Hops []struct {
+					ResolvedHostname string `json:"resolvedHostname"`
+					ResolvedAddress  string `json:"resolvedAddress"`
+
+					Timings []struct {
+						Rtt float64 `json:"rtt"`
+					} `json:"timings"`
+				} `json:"hops"`
+			} `json:"result"`
+		} `json:"results"`
+	}
 
 	if err := json.Unmarshal(bodyBytes, &res); err != nil {
 		return "", nil, err
@@ -260,24 +264,35 @@ func getGlobalpingResults(measurementID string) (string, []Hop, error) {
 
 	var parsed []Hop
 
-	if len(res.Results) > 0 {
-		for _, rawHop := range res.Results[0].Result.Hops {
-
-			if len(rawHop.Stats) == 0 {
-				continue
-			}
-
-			ip := rawHop.Stats[0].IP
-
-			parsed = append(parsed, Hop{
-				TTL:      rawHop.Hop,
-				IP:       ip,
-				Host:     ip,
-				Latency:  rawHop.Stats[0].Rtt,
-				Mappable: false,
-			})
-		}
+	if len(res.Results) == 0 {
+		return res.Status, parsed, nil
 	}
+
+	for i, rawHop := range res.Results[0].Result.Hops {
+
+		if rawHop.ResolvedAddress == "" {
+			continue
+		}
+
+		latency := 0.0
+
+		if len(rawHop.Timings) > 0 {
+			latency = rawHop.Timings[0].Rtt
+		}
+
+		parsed = append(parsed, Hop{
+			TTL:      i + 1,
+			IP:       rawHop.ResolvedAddress,
+			Host:     rawHop.ResolvedHostname,
+			Latency:  latency,
+			Mappable: false,
+		})
+	}
+
+	log.Printf(
+		"✅ PARSED %d HOPS FROM GLOBALPING",
+		len(parsed),
+	)
 
 	return res.Status, parsed, nil
 }
